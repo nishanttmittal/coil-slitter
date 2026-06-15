@@ -10,7 +10,12 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'autoUpdate',
+      scope: '/coil-slitter/',
       includeAssets: ['apple-touch-icon.png'],
+      workbox: {
+        navigateFallback: '/coil-slitter/index.html',
+        navigateFallbackAllowlist: [/^\/coil-slitter/],
+      },
       manifest: {
         name: 'Coil Slitting Optimizer',
         short_name: 'CoilSlit',
