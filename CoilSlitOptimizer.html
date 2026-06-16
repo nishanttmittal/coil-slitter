@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Coil Slitting Optimizer</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @media print {
+      .no-print { display: none !important; }
+      body { background: white !important; }
+    }
+    input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+  </style>
+</head>
+<body class="bg-slate-100 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState } = React;
+
+const COLORS = [
+  '#2563EB','#DC2626','#059669','#D97706','#7C3AED',
+  '#DB2777','#0891B2','#65A30D','#EA580C','#4F46E5',
+  '#0D9488','#BE123C','#6D28D9','#047857','#B45309'
+];
+
+let _uid = 100;
+const uid = () => ++_uid;
+
+// ── Unbounded knapsack: maximize space filled ≤ capacity ──────────────────
+function fillSpace(items, capacity) {
+  const C = Math.round(capacity);
+  if (C <= 0 || !items.length) return items.map(s => ({ ...s, qty: 0 }));
+
+  const valid = items.filter(s => Math.round(Number(s.width)) > 0 && Math.round(Number(s.width)) <= C);
+  if (!valid.length) return items.map(s => ({ ...s, qty: 0 }));
+
+  const dp = new Array(C + 1).fill(null);
+  dp[0] = -1;
+
+  for (let w = 1; w <= C; w++) {
+    for (let i = 0; i < valid.length; i++) {
+      const sw = Math.round(Number(valid[i].width));
+      if (sw <= w && dp[w - sw] !== null) { dp[w] = i; break; }
+    }
+  }
+
+  let best = C;
+  while (best > 0 && dp[best] === null) best--;
+
+  const counts = new Map(valid.map(s => [s.id, 0]));
+  let cur = best;
+  while (cur > 0 && dp[cur] !== -1) {
+    const s = valid[dp[cur]];
+    counts.set(s.id, (counts.get(s.id) || 0) + 1);
+    cur -= Math.round(Number(s.width));
+  }
+
+  return items.map(s => ({ ...s, qty: counts.get(s.id) || 0 }));
+}
+
+// ── 0/1 Knapsack: distribute required pieces optimally into Pass 1 ─────────
+// Pass 2 gets everything not placed in Pass 1.
+function splitIntoTwoPasses(requirements, W) {
+  const W_ = Math.max(1, Math.round(Number(W)));
+
+  // Items with a minimum required quantity (all items with qty > 0)
+  const reqItems = requirements.filter(r => Number(r.width) > 0 && Number(r.qty) > 0);
+  // Items allowed to be used as fill (flexible = true, any extra pieces allowed)
+  const flexItems = requirements.filter(r => Number(r.width) > 0 && r.flexible);
+
+  const totalReq = reqItems.reduce((s, r) => s + Math.round(Number(r.width)) * Number(r.qty), 0);
+
+  if (totalReq > 2 * W_) {
+    return {
+      error: `Total required width (${totalReq} mm) exceeds 2 passes (2 × ${W_} mm = ${2 * W_} mm). ` +
+             `Reduce quantities or add more slit sizes.`,
+    };
+  }
+
+  // Expand required items into individual pieces for 0/1 knapsack
+  const pieces = [];
+  reqItems.forEach(r => {
+    const w = Math.round(Number(r.width));
+    for (let i = 0; i < Number(r.qty); i++) pieces.push({ id: r.id, w });
+  });
+
+  const n = pieces.length;
+  const p1Req = new Map(), p2Req = new Map();
+
+  if (n > 0) {
+    // Full 2D DP for backtracking (n ≤ ~100, W ≤ ~2000 is fine)
+    const dp = Array.from({ length: n + 1 }, () => new Array(W_ + 1).fill(0));
+
+    for (let i = 1; i <= n; i++) {
+      const pw = pieces[i - 1].w;
+      for (let w = 0; w <= W_; w++) {
+        dp[i][w] = dp[i - 1][w];
+        if (pw <= w && dp[i - 1][w - pw] + pw > dp[i][w])
+          dp[i][w] = dp[i - 1][w - pw] + pw;
+      }
+    }
+
+    // Backtrack to determine which pieces go to Pass 1
+    const inPass1 = new Array(n).fill(false);
+    let w = W_;
+    for (let i = n; i >= 1; i--) {
+      const pw = pieces[i - 1].w;
+      if (w >= pw && dp[i][w] === dp[i - 1][w - pw] + pw) {
+        inPass1[i - 1] = true;
+        w -= pw;
+      }
+    }
+
+    pieces.forEach((p, i) => {
+      const m = inPass1[i] ? p1Req : p2Req;
+      m.set(p.id, (m.get(p.id) || 0) + 1);
+    });
+  }
+
+  const used1Req = [...p1Req.entries()].reduce((s, [id, q]) => {
+    const r = requirements.find(x => x.id === id);
+    return s + (r ? Math.round(Number(r.width)) * q : 0);
+  }, 0);
+
+  const used2Req = [...p2Req.entries()].reduce((s, [id, q]) => {
+    const r = requirements.find(x => x.id === id);
+    return s + (r ? Math.round(Number(r.width)) * q : 0);
+  }, 0);
+
+  // Fill remaining space with flexible items
+  const doFill = (space) => {
+    if (space <= 0 || !flexItems.length) return new Map();
+    const filled = fillSpace(flexItems.map(f => ({ ...f, qty: 0 })), space);
+    const m = new Map();
+    filled.forEach(s => { if (s.qty > 0) m.set(s.id, s.qty); });
+    return m;
+  };
+
+  const fill1 = doFill(W_ - used1Req);
+  const fill2 = doFill(W_ - used2Req);
+
+  const makePassResult = (passReq, passFill) =>
+    requirements
+      .filter(r => Number(r.width) > 0)
+      .map(r => ({
+        ...r,
+        reqQty: passReq.get(r.id) || 0,
+        fillQty: passFill.get(r.id) || 0,
+        qty: (passReq.get(r.id) || 0) + (passFill.get(r.id) || 0),
+      }))
+      .filter(r => r.qty > 0);
+
+  const pass1 = makePassResult(p1Req, fill1);
+  const pass2 = makePassResult(p2Req, fill2);
+
+  const used1 = pass1.reduce((s, r) => s + Math.round(Number(r.width)) * r.qty, 0);
+  const used2 = pass2.reduce((s, r) => s + Math.round(Number(r.width)) * r.qty, 0);
+
+  return { pass1, pass2, used1, used2, waste1: W_ - used1, waste2: W_ - used2, error: null };
+}
+
+// ── Pattern Bar ────────────────────────────────────────────────────────────
+function PatternBar({ slits, coilWidth, colorMap }) {
+  const W = Number(coilWidth) || 1;
+  const used = slits.reduce((s, x) => s + Math.round(Number(x.width)) * x.qty, 0);
+  const waste = W - used;
+
+  const segments = [];
+  slits.forEach(s => {
+    for (let q = 0; q < s.qty; q++) {
+      segments.push({
+        width: Math.round(Number(s.width)),
+        color: colorMap.get(s.id) || '#94A3B8',
+        isFill: q >= s.reqQty,
+        label: String(s.width),
+      });
+    }
+  });
+  if (waste > 0)
+    segments.push({ width: waste, color: '#CBD5E1', isFill: false, label: `${waste}`, isWaste: true });
+
+  return (
+    <div>
+      <div className="w-full h-12 flex rounded-lg overflow-hidden border border-gray-200 mb-2">
+        {segments.map((seg, i) => (
+          <div
+            key={i}
+            style={{
+              width: `${(seg.width / W) * 100}%`,
+              backgroundColor: seg.color,
+              opacity: seg.isFill ? 0.55 : 1,
+              minWidth: 1,
+            }}
+            className="flex items-center justify-center cursor-default"
+            title={`${seg.width} mm${seg.isWaste ? ' (waste)' : seg.isFill ? ' (fill)' : ''}`}
+          >
+            {(seg.width / W) > 0.06 && (
+              <span className={`text-xs font-bold select-none drop-shadow-sm ${seg.isWaste ? 'text-gray-500' : 'text-white'}`}>
+                {seg.label}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex justify-between text-xs text-gray-400 font-mono">
+        <span>0</span><span>{Math.round(W / 2)}</span><span>{W} mm</span>
+      </div>
+    </div>
+  );
+}
+
+// ── One Pass Result Panel ──────────────────────────────────────────────────
+function PassPanel({ label, slits, coilWidth, halfWeight, colorMap, reqColorMap }) {
+  const W = Number(coilWidth) || 1;
+  const used = slits.reduce((s, r) => s + Math.round(Number(r.width)) * r.qty, 0);
+  const waste = W - used;
+  const pieces = slits.reduce((s, r) => s + r.qty, 0);
+
+  return (
+    <div className="bg-white rounded-xl shadow p-5 flex flex-col gap-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-bold text-gray-800 text-sm uppercase tracking-wide">{label}</h3>
+        <span className={`text-xs font-semibold px-2 py-1 rounded-full ${
+          waste === 0 ? 'bg-green-100 text-green-700' :
+          waste < 0 ? 'bg-red-100 text-red-700' : 'bg-amber-50 text-amber-700'
+        }`}>
+          {waste < 0 ? `⚠ overflow ${Math.abs(waste)} mm` :
+           waste === 0 ? '✓ zero waste' : `waste: ${waste} mm`}
+        </span>
+      </div>
+
+      <PatternBar slits={slits} coilWidth={W} colorMap={colorMap} />
+
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-gray-100 text-xs text-gray-400 uppercase tracking-wide">
+            <th className="text-left pb-1.5 pr-2"></th>
+            <th className="text-left pb-1.5">Width</th>
+            <th className="text-center pb-1.5">Qty</th>
+            <th className="text-right pb-1.5">Wt / pc</th>
+          </tr>
+        </thead>
+        <tbody>
+          {slits.map(s => {
+            const pieceWt = halfWeight > 0 ? (Math.round(Number(s.width)) / W) * halfWeight : 0;
+            const over = pieceWt > 3000;
+            const hasFill = s.fillQty > 0;
+            const hasReq = s.reqQty > 0;
+            return (
+              <tr key={s.id} className="border-b border-gray-50">
+                <td className="py-1.5 pr-2">
+                  <div className="w-3 h-3 rounded-sm" style={{ backgroundColor: colorMap.get(s.id) }}></div>
+                </td>
+                <td className="py-1.5 font-mono text-gray-700">{s.width} mm</td>
+                <td className="py-1.5 text-center">
+                  <span className="font-bold text-gray-800">{s.qty}</span>
+                  {hasReq && hasFill && (
+                    <span className="ml-1 text-xs text-gray-400">({s.reqQty}+<span className="text-blue-500">{s.fillQty}f</span>)</span>
+                  )}
+                  {!hasReq && hasFill && (
+                    <span className="ml-1 text-xs text-blue-500">(fill)</span>
+                  )}
+                </td>
+                <td className={`py-1.5 text-right font-mono font-semibold ${over ? 'text-red-600' : 'text-gray-600'}`}>
+                  {pieceWt > 0
+                    ? (pieceWt >= 1000 ? (pieceWt / 1000).toFixed(3) + ' t' : pieceWt.toFixed(0) + ' kg')
+                    : '—'}
+                  {over && ' ⚠'}
+                </td>
+              </tr>
+            );
+          })}
+          {slits.length === 0 && (
+            <tr><td colSpan={4} className="py-3 text-center text-gray-400 text-xs">No slits in this pass</td></tr>
+          )}
+        </tbody>
+      </table>
+
+      <div className="flex justify-between text-xs text-gray-500 pt-1 border-t border-gray-100">
+        <span>Used: <strong className="text-gray-800">{used} / {W} mm</strong></span>
+        <span>Pieces: <strong className="text-gray-800">{pieces}</strong></span>
+        <span className={waste < 0 ? 'text-red-600 font-bold' : ''}>
+          Waste: <strong>{Math.max(waste, 0)} mm ({((Math.max(waste, 0) / W) * 100).toFixed(1)}%)</strong>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ── Requirements Table ─────────────────────────────────────────────────────
+function RequirementsTable({ requirements, onChange }) {
+  const set = (id, field, val) =>
+    onChange(requirements.map(r => r.id === id ? { ...r, [field]: val } : r));
+  const remove = (id) => onChange(requirements.filter(r => r.id !== id));
+  const add = () => onChange([...requirements, { id: uid(), width: '', qty: 1, flexible: false }]);
+
+  return (
+    <div className="bg-white rounded-xl shadow overflow-hidden">
+      <div className="px-5 pt-5 pb-3 border-b border-gray-100">
+        <h2 className="text-xs font-bold text-gray-400 uppercase tracking-widest">
+          Slit Requirements — enter all sizes here
+        </h2>
+        <p className="text-xs text-gray-400 mt-1">
+          Set <strong>Min Qty</strong> for sizes you must produce. Check <strong>Use as Fill</strong> to let the optimizer add extra pieces of that size to reduce waste.
+        </p>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-gray-100 text-xs text-gray-400 uppercase tracking-wide bg-slate-50">
+              <th className="py-2.5 px-3 text-left w-8"></th>
+              <th className="py-2.5 px-3 text-left">Width (mm)</th>
+              <th className="py-2.5 px-3 text-left">Min Qty Required</th>
+              <th className="py-2.5 px-4 text-center">Use as Fill</th>
+              <th className="w-10"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {requirements.map((r, i) => (
+              <tr key={r.id} className="border-b border-gray-50 hover:bg-slate-50">
+                <td className="py-2.5 px-3">
+                  <div className="w-3.5 h-3.5 rounded" style={{ backgroundColor: COLORS[i % COLORS.length] }}></div>
+                </td>
+                <td className="py-2 px-3">
+                  <input
+                    type="number" min="1" value={r.width} placeholder="e.g. 300"
+                    onChange={e => set(r.id, 'width', e.target.value)}
+                    className="w-28 border border-gray-300 rounded-lg px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </td>
+                <td className="py-2 px-3">
+                  <div className="flex items-center gap-1.5">
+                    <button onClick={() => set(r.id, 'qty', Math.max(0, Number(r.qty) - 1))}
+                      className="w-7 h-7 rounded border border-gray-300 text-gray-600 hover:bg-gray-100 flex items-center justify-center text-base no-print">−</button>
+                    <input
+                      type="number" min="0" value={r.qty}
+                      onChange={e => set(r.id, 'qty', e.target.value)}
+                      className="w-16 border border-gray-300 rounded-lg px-2 py-1.5 text-sm text-center font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    />
+                    <button onClick={() => set(r.id, 'qty', Number(r.qty) + 1)}
+                      className="w-7 h-7 rounded border border-gray-300 text-gray-600 hover:bg-gray-100 flex items-center justify-center text-base no-print">+</button>
+                  </div>
+                </td>
+                <td className="py-2 px-4 text-center">
+                  <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                    <div
+                      onClick={() => set(r.id, 'flexible', !r.flexible)}
+                      className={`w-10 h-5 rounded-full transition-colors cursor-pointer relative ${r.flexible ? 'bg-blue-500' : 'bg-gray-300'}`}
+                    >
+                      <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${r.flexible ? 'translate-x-5' : 'translate-x-0.5'}`}></div>
+                    </div>
+                    <span className={`text-xs font-medium ${r.flexible ? 'text-blue-600' : 'text-gray-400'}`}>
+                      {r.flexible ? 'Fill' : 'Fixed'}
+                    </span>
+                  </label>
+                </td>
+                <td className="py-2 px-2 no-print">
+                  <button onClick={() => remove(r.id)} className="text-gray-300 hover:text-red-500 text-xl leading-none">×</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="px-5 py-4 border-t border-gray-100 flex items-center gap-3 no-print">
+        <button onClick={add}
+          className="text-sm px-4 py-2 border-2 border-blue-500 text-blue-600 rounded-lg hover:bg-blue-50 font-semibold">
+          + Add Size
+        </button>
+        <span className="text-xs text-gray-400">
+          {requirements.filter(r => !r.flexible && Number(r.qty) > 0).length} fixed sizes ·{' '}
+          {requirements.filter(r => r.flexible).length} fill sizes
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ── Weight Check Panel ─────────────────────────────────────────────────────
+function WeightCheckPanel({ result, coilWidth, halfWeight }) {
+  if (!result || result.error) return null;
+
+  const W = Number(coilWidth) || 1;
+  const allSlits = [...(result.pass1 || []), ...(result.pass2 || [])];
+  const uniqueWidths = [...new Set(allSlits.map(s => Math.round(Number(s.width))))];
+  const widestSlit = Math.max(0, ...uniqueWidths);
+  const maxAllowedWeight = widestSlit > 0 && W > 0 ? Math.floor(6000 * W / widestSlit) : 0;
+  const enteredWeight = halfWeight * 2;
+  const weightTooHigh = enteredWeight > 0 && maxAllowedWeight > 0 && enteredWeight > maxAllowedWeight;
+
+  return (
+    <div className={`rounded-xl border-2 p-5 ${weightTooHigh ? 'bg-red-50 border-red-400' : 'bg-green-50 border-green-400'}`}>
+      <div className="text-xs font-bold uppercase tracking-widest text-gray-500 mb-3">
+        Weight Check — 3 t / slit coil limit
+      </div>
+      <div className="flex flex-wrap items-center gap-6 mb-4">
+        <div>
+          <div className="text-xs text-gray-500">Your coil weight</div>
+          <div className={`text-2xl font-bold font-mono ${weightTooHigh ? 'text-red-600' : 'text-gray-800'}`}>
+            {enteredWeight > 0 ? (enteredWeight / 1000).toFixed(3) + ' t' : <span className="text-gray-300 text-lg">Not entered</span>}
+          </div>
+        </div>
+        <div className="text-2xl text-gray-300">vs</div>
+        <div>
+          <div className="text-xs text-gray-500">Max allowed (widest slit: {widestSlit} mm)</div>
+          <div className={`text-2xl font-bold font-mono ${weightTooHigh ? 'text-red-600' : 'text-green-700'}`}>
+            {maxAllowedWeight > 0 ? (maxAllowedWeight / 1000).toFixed(3) + ' t' : '—'}
+          </div>
+        </div>
+        {enteredWeight > 0 && maxAllowedWeight > 0 && (
+          <div className={`w-12 h-12 rounded-full flex items-center justify-center text-2xl font-bold border-4 ${
+            weightTooHigh ? 'bg-red-100 border-red-400 text-red-600' : 'bg-green-100 border-green-400 text-green-600'
+          }`}>{weightTooHigh ? '✗' : '✓'}</div>
+        )}
+        {enteredWeight > 0 && maxAllowedWeight > 0 && (
+          <div className={`text-sm font-semibold px-4 py-2 rounded-lg ${weightTooHigh ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+            {weightTooHigh
+              ? `⚠ ${((enteredWeight - maxAllowedWeight) / 1000).toFixed(2)} t too heavy`
+              : '✓ All slit coils under 3 t'}
+          </div>
+        )}
+      </div>
+
+      {halfWeight > 0 && uniqueWidths.length > 0 && (
+        <>
+          <div className="text-xs font-semibold text-gray-500 mb-2">Slit coil weights per piece (per pass):</div>
+          <div className="flex flex-wrap gap-2">
+            {uniqueWidths.sort((a, b) => b - a).map(w => {
+              const wt = (w / W) * halfWeight;
+              const over = wt > 3000;
+              return (
+                <div key={w} className={`text-xs px-3 py-1.5 rounded-lg font-mono font-semibold border ${
+                  over ? 'bg-red-100 border-red-300 text-red-700' : 'bg-white border-gray-200 text-gray-700'
+                }`}>
+                  {w} mm → {wt >= 1000 ? (wt / 1000).toFixed(3) + ' t' : wt.toFixed(0) + ' kg'} {over ? '⚠' : '✓'}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────────────
+const DEFAULT_REQS = [
+  { id: uid(), width: 300, qty: 3, flexible: false },
+  { id: uid(), width: 250, qty: 2, flexible: false },
+  { id: uid(), width: 200, qty: 4, flexible: false },
+  { id: uid(), width: 150, qty: 0, flexible: true },
+  { id: uid(), width: 100, qty: 0, flexible: true },
+];
+
+function App() {
+  const [coil, setCoil] = useState({ width: '', weight: '', thickness: '' });
+  const [requirements, setRequirements] = useState(DEFAULT_REQS);
+
+  const W = Number(coil.width) || 0;
+  const coilReady = W > 0;
+  const totalWeight = Number(coil.weight) || 0;
+  const thickness = Number(coil.thickness) || 1;
+  const halfWeight = totalWeight / 2;
+
+  const coilLength = totalWeight > 0 && W > 0 && thickness > 0
+    ? (totalWeight * 1e6) / (7850 * W * thickness)
+    : 0;
+
+  // Auto-compute result whenever inputs change
+  const result = coilReady ? splitIntoTwoPasses(requirements, W) : null;
+
+  // Build color map: requirement id → color (consistent across both passes)
+  const colorMap = new Map(requirements.map((r, i) => [r.id, COLORS[i % COLORS.length]]));
+
+  // Summary for requirements
+  const totalReqWidth = requirements
+    .filter(r => Number(r.width) > 0 && Number(r.qty) > 0)
+    .reduce((s, r) => s + Math.round(Number(r.width)) * Number(r.qty), 0);
+
+  const setCoilField = (f, v) => setCoil(c => ({ ...c, [f]: v }));
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+
+      {/* Header */}
+      <header className="bg-blue-900 text-white px-6 py-4 shadow-xl no-print">
+        <div className="max-w-6xl mx-auto flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">🏭 Coil Slitting Optimizer</h1>
+            <p className="text-blue-300 text-sm mt-0.5">Enter sizes once · auto-split into two passes · minimize waste</p>
+          </div>
+          <div className="text-right text-sm text-blue-200">
+            {coilReady
+              ? <><div>Mother Coil: <strong className="text-white font-mono">{W} mm</strong></div>
+                  <div>Total Weight: <strong className="text-white font-mono">{totalWeight > 0 ? (totalWeight/1000).toFixed(1)+' t' : '—'}</strong></div></>
+              : <div className="text-amber-300 font-semibold animate-pulse">↓ Enter coil width to begin</div>
+            }
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-6xl mx-auto p-4 space-y-4">
+
+        {/* Coil Parameters */}
+        <div className={`bg-white rounded-xl shadow p-5 ${!coilReady ? 'ring-2 ring-blue-400' : ''}`}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Mother Coil Parameters</h2>
+            {!coilReady && <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-full font-semibold animate-pulse">Step 1 — Enter coil width</span>}
+          </div>
+          <div className="flex flex-wrap gap-5 items-end">
+            {/* Width — prominent */}
+            <label className="flex flex-col gap-1.5">
+              <span className="text-xs font-bold text-blue-700 uppercase tracking-wide">Coil Width (mm) <span className="text-red-500">*</span></span>
+              <input type="number" value={coil.width} min="1" step="1" placeholder="e.g. 1250" autoFocus
+                onChange={e => setCoilField('width', e.target.value)}
+                className={`border-2 rounded-lg px-4 py-2.5 w-44 text-xl font-bold focus:outline-none focus:ring-2 focus:ring-blue-400 font-mono ${
+                  coilReady ? 'border-blue-400 text-blue-700 bg-blue-50' : 'border-blue-300 text-gray-700'
+                }`}
+              />
+            </label>
+            {[
+              { label: 'Total Weight (kg)', field: 'weight', step: 100, ph: '20000' },
+              { label: 'Thickness (mm)', field: 'thickness', step: 0.1, ph: '2.0' },
+            ].map(({ label, field, step, ph }) => (
+              <label key={field} className="flex flex-col gap-1.5">
+                <span className="text-xs font-semibold text-gray-500">{label}</span>
+                <input type="number" value={coil[field]} step={step} min="0" placeholder={ph}
+                  onChange={e => setCoilField(field, e.target.value)}
+                  className="border border-gray-300 rounded-lg px-3 py-2 w-36 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+                />
+              </label>
+            ))}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs font-semibold text-gray-500">Per-Pass Weight</span>
+              <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-sm font-mono text-gray-700 w-36">
+                {halfWeight > 0 ? (halfWeight / 1000).toFixed(3) + ' t' : '—'}
+              </div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs font-semibold text-gray-500">Est. Coil Length</span>
+              <div className="px-3 py-2 bg-slate-50 rounded-lg border border-slate-200 text-sm font-mono text-gray-700 w-36">
+                {coilLength > 0 ? coilLength.toFixed(0) + ' m' : '—'}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Requirements Table */}
+        <RequirementsTable requirements={requirements} onChange={setRequirements} />
+
+        {/* Total requirements indicator */}
+        {coilReady && totalReqWidth > 0 && (
+          <div className={`text-sm font-semibold px-4 py-3 rounded-xl ${
+            totalReqWidth > 2 * W
+              ? 'bg-red-100 text-red-700 border border-red-300'
+              : totalReqWidth > W
+              ? 'bg-blue-50 text-blue-700 border border-blue-200'
+              : 'bg-green-50 text-green-700 border border-green-200'
+          }`}>
+            {totalReqWidth > 2 * W
+              ? `⚠ Required width ${totalReqWidth} mm exceeds 2 × ${W} mm — reduce quantities`
+              : totalReqWidth > W
+              ? `ℹ Required ${totalReqWidth} mm > one pass (${W} mm) → will be split across both passes`
+              : `✓ Required ${totalReqWidth} mm fits in one pass (${W} mm) — remaining space will be filled`
+            }
+          </div>
+        )}
+
+        {/* Error */}
+        {result?.error && (
+          <div className="bg-red-50 border-2 border-red-400 rounded-xl p-4 text-red-700 font-semibold text-sm">
+            ⚠ {result.error}
+          </div>
+        )}
+
+        {/* Results: two passes side by side */}
+        {coilReady && result && !result.error && (
+          <>
+            <div>
+              <div className="flex items-center gap-3 mb-3">
+                <h2 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Auto-Split Result</h2>
+                <div className="flex gap-2 text-xs flex-wrap">
+                  <span className="bg-gray-700 text-white px-2 py-0.5 rounded">Solid = required</span>
+                  <span className="bg-blue-200 text-blue-800 px-2 py-0.5 rounded">Faded = fill</span>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <PassPanel
+                  label="Pass 1 — First Half of Coil"
+                  slits={result.pass1}
+                  coilWidth={W}
+                  halfWeight={halfWeight}
+                  colorMap={colorMap}
+                />
+                <PassPanel
+                  label="Pass 2 — Second Half of Coil"
+                  slits={result.pass2}
+                  coilWidth={W}
+                  halfWeight={halfWeight}
+                  colorMap={colorMap}
+                />
+              </div>
+            </div>
+
+            {/* Combined totals */}
+            <div className="bg-white rounded-xl shadow p-5">
+              <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-4">Combined Production Summary</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b-2 border-gray-200 text-xs text-gray-500 uppercase tracking-wide">
+                      <th className="text-left pb-2 pr-2"></th>
+                      <th className="text-left pb-2">Width</th>
+                      <th className="text-center pb-2">Pass 1</th>
+                      <th className="text-center pb-2">Pass 2</th>
+                      <th className="text-center pb-2">Total Pieces</th>
+                      <th className="text-right pb-2">Wt / piece</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {requirements.filter(r => Number(r.width) > 0).map((r, i) => {
+                      const p1 = result.pass1.find(s => s.id === r.id);
+                      const p2 = result.pass2.find(s => s.id === r.id);
+                      const q1 = p1?.qty || 0;
+                      const q2 = p2?.qty || 0;
+                      const total = q1 + q2;
+                      const pieceWt = halfWeight > 0 && W > 0
+                        ? (Math.round(Number(r.width)) / W) * halfWeight : 0;
+                      const over = pieceWt > 3000;
+                      if (total === 0 && Number(r.qty) === 0 && !r.flexible) return null;
+                      return (
+                        <tr key={r.id} className="border-b border-gray-100 hover:bg-slate-50">
+                          <td className="py-2.5 pr-2">
+                            <div className="w-3.5 h-3.5 rounded-sm" style={{ backgroundColor: COLORS[i % COLORS.length] }}></div>
+                          </td>
+                          <td className="py-2.5 font-mono text-gray-700">{r.width} mm</td>
+                          <td className="py-2.5 text-center">
+                            {q1 > 0 ? (
+                              <span className="font-bold text-gray-800">{q1}
+                                {p1?.fillQty > 0 && <span className="text-xs text-blue-500 font-normal ml-1">({p1.reqQty}+{p1.fillQty}f)</span>}
+                              </span>
+                            ) : <span className="text-gray-300">—</span>}
+                          </td>
+                          <td className="py-2.5 text-center">
+                            {q2 > 0 ? (
+                              <span className="font-bold text-gray-800">{q2}
+                                {p2?.fillQty > 0 && <span className="text-xs text-blue-500 font-normal ml-1">({p2.reqQty}+{p2.fillQty}f)</span>}
+                              </span>
+                            ) : <span className="text-gray-300">—</span>}
+                          </td>
+                          <td className="py-2.5 text-center font-bold text-gray-800">
+                            {total > 0 ? total : <span className="text-gray-300">—</span>}
+                            {r.flexible && total > Number(r.qty) && (
+                              <span className="ml-1 text-xs text-blue-500 font-normal">({r.qty} req)</span>
+                            )}
+                          </td>
+                          <td className={`py-2.5 text-right font-mono font-semibold ${over ? 'text-red-600' : 'text-gray-600'}`}>
+                            {pieceWt > 0
+                              ? (pieceWt >= 1000 ? (pieceWt/1000).toFixed(3)+' t' : pieceWt.toFixed(0)+' kg')
+                              : '—'}
+                            {over && ' ⚠'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="border-t-2 border-gray-200 bg-slate-50 font-semibold text-sm">
+                      <td></td>
+                      <td className="py-2.5 text-gray-500 text-xs uppercase">Total</td>
+                      <td className="py-2.5 text-center text-gray-700">
+                        {result.used1} mm
+                        <span className="block text-xs text-gray-400 font-normal">
+                          waste: {result.waste1} mm ({((result.waste1 / W) * 100).toFixed(1)}%)
+                        </span>
+                      </td>
+                      <td className="py-2.5 text-center text-gray-700">
+                        {result.used2} mm
+                        <span className="block text-xs text-gray-400 font-normal">
+                          waste: {result.waste2} mm ({((result.waste2 / W) * 100).toFixed(1)}%)
+                        </span>
+                      </td>
+                      <td className="py-2.5 text-center text-gray-700">
+                        {(result.pass1.reduce((s,r)=>s+r.qty,0) + result.pass2.reduce((s,r)=>s+r.qty,0))} pcs
+                      </td>
+                      <td></td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </div>
+
+            {/* Weight check */}
+            <WeightCheckPanel result={result} coilWidth={W} halfWeight={halfWeight} />
+          </>
+        )}
+
+        {/* Legend */}
+        {coilReady && requirements.some(r => Number(r.width) > 0) && (
+          <div className="bg-white rounded-xl shadow p-4 no-print">
+            <div className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2">Size Legend</div>
+            <div className="flex flex-wrap gap-3">
+              {requirements.filter(r => Number(r.width) > 0).map((r, i) => (
+                <div key={r.id} className="flex items-center gap-1.5 text-xs">
+                  <div className="w-3 h-3 rounded-sm" style={{ backgroundColor: COLORS[i % COLORS.length] }}></div>
+                  <span className="font-mono text-gray-700">{r.width} mm</span>
+                  {r.flexible && <span className="text-blue-500">(fill)</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pb-6 no-print">
+          <button onClick={() => window.print()}
+            className="px-5 py-2.5 bg-gray-700 text-white text-sm rounded-lg hover:bg-gray-800 font-semibold shadow">
+            🖨 Print / Save as PDF
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
