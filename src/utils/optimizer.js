@@ -39,6 +39,15 @@ export function splitIntoTwoPasses(requirements, W) {
   const reqItems = allValid.filter(r => Number(r.qty) > 0)
   const flexItems = allValid.filter(r => r.flexible)
 
+  // A single required strip can never be cut from a narrower coil. Catch this
+  // BEFORE the knapsack runs, otherwise it produces nonsense (negative waste).
+  const tooWide = reqItems.find(r => Math.round(Number(r.width)) > W_)
+  if (tooWide) {
+    return {
+      error: `Strip ${Math.round(Number(tooWide.width))} mm is wider than the coil (${W_} mm). Remove it or use a wider coil.`,
+    }
+  }
+
   const totalReq = reqItems.reduce(
     (s, r) => s + Math.round(Number(r.width)) * Number(r.qty), 0
   )
